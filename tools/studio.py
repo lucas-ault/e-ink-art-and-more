@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Local API for loading a picture, cropping it, and pushing it to the panel.
+"""Local API for loading a picture, saving it, and pushing it to the panel.
 
     python3 tools/studio.py
 
-Listens on 127.0.0.1:8765. The page at / is one client. The same routes take
-curl. The password in a Wi-Fi change is forwarded to the board and is not
-written here.
+Listens on 127.0.0.1:8765. The Next.js app and curl use the same routes.
+The password in a Wi-Fi change is forwarded to the board and is not written here.
 """
 
 import io
 import json
+import shutil
 import socket
 import sys
 import threading
+from datetime import datetime, timezone
 from email.parser import BytesParser
 from email.policy import HTTP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,9 +36,12 @@ from render_and_push import (  # noqa: E402
 
 HOST = "127.0.0.1"
 PORT = 8765
+ROOT = Path(__file__).resolve().parents[1]
 CACHE = Path(__file__).resolve().parent / ".cache"
-PAGE = Path(__file__).resolve().parent / "studio.html"
 SETTINGS = CACHE / "studio.json"
+LIBRARY = ROOT / "data" / "library"
+INDEX_PATH = LIBRARY / "index.json"
+NOW_PATH = LIBRARY / "now.json"
 MAX_BODY = 40 * 1024 * 1024
 
 LOCK = threading.Lock()
@@ -129,27 +133,44 @@ def crop_box(image, crop):
     return image.crop((left, top, right, bottom)).resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
 
 
-def store_source(image, kind):
+def store_source(image, kind, title="", url=""):
     image = image.convert("RGB")
     source_id = uuid4().hex
+    label = title.strip() or "Untitled"
     with LOCK:
-        SOURCES[source_id] = {"image": image, "kind": kind}
+        SOURCES[source_id] = {
+            "image": image,
+            "kind": kind,
+            "title": label,
+            "url": url,
+        }
     return {
         "id": source_id,
         "kind": kind,
+        "title": label,
         "width": image.width,
         "height": image.height,
     }
 
 
-def source_image(source_id):
+def source_record(source_id):
     if not isinstance(source_id, str) or len(source_id) != 32:
         raise StudioError(404, "unknown source")
     with LOCK:
         found = SOURCES.get(source_id)
         if found is None:
             raise StudioError(404, "unknown source")
-        return found["image"].copy(), found["kind"]
+        return {
+            "image": found["image"].copy(),
+            "kind": found["kind"],
+            "title": found.get("title") or "Untitled",
+            "url": found.get("url") or "",
+        }
+
+
+def source_image(source_id):
+    record = source_record(source_id)
+    return record["image"], record["kind"]
 
 
 def open_bytes(data):
@@ -229,6 +250,168 @@ def render_frame(source_id, crop):
     return frame
 
 
+def write_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2))
+    temporary.replace(path)
+
+
+def load_index():
+    try:
+        data = json.loads(INDEX_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def load_now():
+    try:
+        data = json.loads(NOW_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def piece_dir(piece_id):
+    if (
+        not isinstance(piece_id, str)
+        or len(piece_id) != 32
+        or any(char not in "0123456789abcdef" for char in piece_id)
+    ):
+        raise StudioError(404, "unknown piece")
+    return LIBRARY / piece_id
+
+
+def load_meta(piece_id):
+    folder = piece_dir(piece_id)
+    try:
+        data = json.loads((folder / "meta.json").read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StudioError(404, "unknown piece") from exc
+    if not isinstance(data, dict):
+        raise StudioError(404, "unknown piece")
+    return data
+
+
+def public_piece(meta):
+    return {
+        "id": meta["id"],
+        "title": meta.get("title") or "Untitled",
+        "kind": meta.get("kind") or "image",
+        "width": meta.get("width"),
+        "height": meta.get("height"),
+        "added": meta.get("added"),
+        "url": meta.get("url") or "",
+    }
+
+
+def save_piece(source_id, crop, title):
+    record = source_record(source_id)
+    frame = render_frame(source_id, crop)
+    piece_id = uuid4().hex
+    chosen = title.strip() if isinstance(title, str) else ""
+    if not chosen:
+        chosen = record["title"]
+    meta = {
+        "id": piece_id,
+        "title": chosen[:120],
+        "kind": record["kind"],
+        "url": record["url"],
+        "width": record["image"].width,
+        "height": record["image"].height,
+        "crop": {
+            "x": float(crop["x"]),
+            "y": float(crop["y"]),
+            "width": float(crop["width"]),
+            "height": float(crop["height"]),
+        },
+        "added": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    folder = piece_dir(piece_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    record["image"].save(folder / "image.png", format="PNG")
+    (folder / "frame.bin").write_bytes(frame)
+    write_json(folder / "meta.json", meta)
+    with LOCK:
+        items = load_index()
+        items.append(public_piece(meta))
+        write_json(INDEX_PATH, items)
+    return public_piece(meta)
+
+
+def stored_frame(piece_id):
+    load_meta(piece_id)
+    frame = (piece_dir(piece_id) / "frame.bin").read_bytes()
+    if len(frame) != FRAME_BYTES:
+        raise StudioError(500, "stored frame is incomplete")
+    return frame
+
+
+def delete_piece(piece_id):
+    load_meta(piece_id)
+    with LOCK:
+        items = [item for item in load_index() if item.get("id") != piece_id]
+        write_json(INDEX_PATH, items)
+    shutil.rmtree(piece_dir(piece_id), ignore_errors=True)
+
+
+def remember_label(host):
+    name, port = split_host(host)
+    label = name if port == 80 else f"{name}:{port}"
+    remember_host(label)
+    return label
+
+
+def push_frame(host, frame):
+    name, port = split_host(host)
+    label = remember_label(host)
+    try:
+        push(name, port, frame)
+    except RuntimeError as exc:
+        if "busy" in str(exc):
+            raise StudioError(409, "panel is busy") from exc
+        raise StudioError(502, str(exc)) from exc
+    except requests.HTTPError as exc:
+        code = exc.response.status_code if exc.response is not None else 502
+        if code == 409:
+            raise StudioError(409, "panel is busy") from exc
+        raise StudioError(502, f"board returned {code}") from exc
+    except requests.RequestException as exc:
+        raise StudioError(502, f"board unreachable: {exc}") from exc
+    return label
+
+
+def show_piece(host, piece_id):
+    meta = load_meta(piece_id)
+    label = push_frame(host, stored_frame(piece_id))
+    now = {"id": meta["id"], "title": meta.get("title") or "Untitled", "host": label}
+    write_json(NOW_PATH, now)
+    return now
+
+
+def next_piece_id():
+    items = load_index()
+    if not items:
+        raise StudioError(400, "library is empty")
+    ids = [item["id"] for item in items if item.get("id")]
+    current = (load_now() or {}).get("id")
+    if current in ids and len(ids) > 1:
+        return ids[(ids.index(current) + 1) % len(ids)]
+    return ids[0]
+
+
+def panel_busy(host):
+    if not host:
+        return None, False
+    try:
+        response = board_request("GET", host, "/health", timeout=5)
+        body = response.json()
+    except (StudioError, ValueError):
+        return None, False
+    return bool(body.get("busy")), True
+
+
 def board_request(method, host, path, body=None, timeout=10, content_type=None):
     name, port = split_host(host)
     headers = {}
@@ -284,9 +467,6 @@ class Handler(BaseHTTPRequestHandler):
     def route_get(self):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
-        if parsed.path == "/":
-            self.send_bytes(200, "text/html; charset=utf-8", PAGE.read_bytes())
-            return
         if parsed.path == "/api/settings":
             self.send_json(200, {"host": load_settings().get("host", "")})
             return
@@ -295,6 +475,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/wifi":
             self.proxy_get(query, "/wifi", 5)
+            return
+        if parsed.path == "/api/library":
+            self.send_json(200, {"pieces": load_index()})
+            return
+        if parsed.path == "/api/now":
+            self.send_now()
+            return
+        library_match = self.library_get(parsed.path)
+        if library_match:
             return
         prefix = "/api/sources/"
         if parsed.path.startswith(prefix):
@@ -333,13 +522,71 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/wifi":
             self.post_wifi(data)
             return
+        if parsed.path == "/api/library":
+            piece = save_piece(data.get("id"), data.get("crop"), data.get("title"))
+            self.send_json(200, piece)
+            return
+        if parsed.path == "/api/show":
+            now = show_piece(data.get("host", ""), data.get("id"))
+            self.send_json(200, {"ok": True, **now})
+            return
+        if parsed.path == "/api/next":
+            now = show_piece(data.get("host", ""), next_piece_id())
+            self.send_json(200, {"ok": True, **now})
+            return
         raise StudioError(404, "not found")
+
+    def do_DELETE(self):
+        try:
+            parsed = urlparse(self.path)
+            prefix = "/api/library/"
+            if not parsed.path.startswith(prefix) or "/" in parsed.path[len(prefix):]:
+                raise StudioError(404, "not found")
+            delete_piece(parsed.path[len(prefix):])
+            self.send_json(200, {"ok": True})
+        except StudioError as exc:
+            self.send_json(exc.status, {"error": str(exc)})
+        except Exception as exc:
+            self.send_json(500, {"error": str(exc)})
+
+    def library_get(self, path):
+        prefix = "/api/library/"
+        if not path.startswith(prefix):
+            return False
+        rest = path[len(prefix):]
+        preview = rest.endswith("/preview")
+        piece_id = rest[: -len("/preview")] if preview else rest
+        if not piece_id or "/" in piece_id:
+            raise StudioError(404, "not found")
+        if preview:
+            self.send_bytes(200, "image/png", frame_png(stored_frame(piece_id)))
+            return True
+        image_path = piece_dir(piece_id) / "image.png"
+        load_meta(piece_id)
+        self.send_bytes(200, "image/png", image_path.read_bytes())
+        return True
+
+    def send_now(self):
+        now = load_now() or {}
+        host = now.get("host") or load_settings().get("host", "")
+        busy, reachable = panel_busy(host)
+        self.send_json(200, {
+            "id": now.get("id"),
+            "title": now.get("title"),
+            "host": host,
+            "busy": busy,
+            "reachable": reachable,
+        })
 
     def post_source(self, ctype, body):
         if ctype.startswith("application/json"):
             data = read_json(body)
-            image, kind = load_url(data.get("url"))
-        elif ctype.startswith("multipart/form-data"):
+            url = data.get("url")
+            image, kind = load_url(url if isinstance(url, str) else "")
+            host_name = urlparse(url).hostname if isinstance(url, str) else ""
+            self.send_json(200, store_source(image, kind, title=host_name or "Untitled", url=url or ""))
+            return
+        if ctype.startswith("multipart/form-data"):
             fields = parse_multipart(ctype, body)
             upload = fields.get("file")
             if not upload or not upload["data"]:
@@ -347,35 +594,19 @@ class Handler(BaseHTTPRequestHandler):
             image = open_bytes(upload["data"])
             if image is None:
                 raise StudioError(400, "file is not a readable image")
-            kind = "image"
-        else:
-            raise StudioError(400, "send a file or a json url")
-        self.send_json(200, store_source(image, kind))
+            filename = upload.get("filename") or ""
+            title = Path(filename).stem or "Untitled"
+            self.send_json(200, store_source(image, "image", title=title))
+            return
+        raise StudioError(400, "send a file or a json url")
 
     def post_push(self, data):
-        host = data.get("host", "")
-        name, port = split_host(host)
-        remember_host(name if port == 80 else f"{name}:{port}")
-        frame = render_frame(data.get("id"), data.get("crop"))
-        try:
-            push(name, port, frame)
-        except RuntimeError as exc:
-            if "busy" in str(exc):
-                raise StudioError(409, "panel is busy") from exc
-            raise StudioError(502, str(exc)) from exc
-        except requests.HTTPError as exc:
-            code = exc.response.status_code if exc.response is not None else 502
-            if code == 409:
-                raise StudioError(409, "panel is busy") from exc
-            raise StudioError(502, f"board returned {code}") from exc
-        except requests.RequestException as exc:
-            raise StudioError(502, f"board unreachable: {exc}") from exc
+        push_frame(data.get("host", ""), render_frame(data.get("id"), data.get("crop")))
         self.send_json(200, {"ok": True})
 
     def post_clear(self, data):
         host = data.get("host", "")
-        name, port = split_host(host)
-        remember_host(name if port == 80 else f"{name}:{port}")
+        remember_label(host)
         response = board_request("POST", host, "/clear", body=b"", timeout=180)
         if response.status_code == 409:
             raise StudioError(409, "panel is busy")

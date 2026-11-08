@@ -5,6 +5,9 @@ firmware/managed_components/
 firmware/dependencies.lock
 firmware/main/secrets.h
 tools/.cache/
+data/
+web/node_modules/
+web/.next/
 tools/__pycache__/
 __pycache__/
 .DS_Store
