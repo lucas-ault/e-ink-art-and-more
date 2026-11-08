@@ -48,11 +48,14 @@ def screenshot(url: str, dest: Path) -> None:
         url,
     ]
     print(f"screenshot {url}")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("chrome screenshot timed out") from exc
     if result.returncode != 0 or not dest.exists():
         sys.stderr.write(result.stdout)
         sys.stderr.write(result.stderr)
-        raise SystemExit(f"chrome screenshot failed ({result.returncode})")
+        raise RuntimeError(f"chrome screenshot failed ({result.returncode})")
 
 
 def closest(r: int, g: int, b: int) -> int:
@@ -131,7 +134,7 @@ def push(host: str, port: int, frame: bytes) -> None:
     health.raise_for_status()
     print(health.text.strip())
     if '"busy":true' in health.text.replace(" ", ""):
-        raise SystemExit("panel is busy")
+        raise RuntimeError("panel is busy")
     print(f"posting {len(frame)} bytes to {base}/frame")
     response = requests.post(
         f"{base}/frame",
@@ -151,19 +154,22 @@ def main() -> None:
     parser.add_argument("--save", help="Also copy the screenshot PNG to this path")
     args = parser.parse_args()
 
-    cache = Path(__file__).resolve().parent / ".cache"
-    cache.mkdir(parents=True, exist_ok=True)
-    png = cache / "page.png"
-    screenshot(args.url, png)
-    if args.save:
-        Path(args.save).write_bytes(png.read_bytes())
+    try:
+        cache = Path(__file__).resolve().parent / ".cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        png = cache / "page.png"
+        screenshot(args.url, png)
+        if args.save:
+            Path(args.save).write_bytes(png.read_bytes())
 
-    with Image.open(png) as image:
-        print(f"screenshot {image.size[0]}x{image.size[1]}")
-        frame = dither_and_pack(image)
-    if len(frame) != FRAME_BYTES:
-        raise SystemExit(f"frame is {len(frame)} bytes, expected {FRAME_BYTES}")
-    push(args.host, args.port, frame)
+        with Image.open(png) as image:
+            print(f"screenshot {image.size[0]}x{image.size[1]}")
+            frame = dither_and_pack(image)
+        if len(frame) != FRAME_BYTES:
+            raise RuntimeError(f"frame is {len(frame)} bytes, expected {FRAME_BYTES}")
+        push(args.host, args.port, frame)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 if __name__ == "__main__":
