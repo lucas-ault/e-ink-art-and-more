@@ -1,0 +1,15 @@
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/managed_components/
+firmware/dependencies.lock
+firmware/main/secrets.h
+tools/.cache/
+tools/__pycache__/
+__pycache__/
+.DS_Store
+
+display-vendor-files/**/build/
+display-vendor-files/**/.zencoder/
+display-vendor-files/**/.zenflow/
+display-vendor-files/**/sdkconfig.old
